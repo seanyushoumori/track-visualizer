@@ -7,5 +7,7 @@
     "name": "abadsinger"
   },
   "main": "index.js",
-  "dependencies": {}
+  "dependencies": {
+    "subway-builder": "^1.0.0"
+  }
 }
