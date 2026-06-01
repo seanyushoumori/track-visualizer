@@ -1,5 +1,5 @@
 {
-  "id": "com.abadsinger.trackvisualizer",
+  "id": "track-visualizer",
   "name": "Track Visualizer",
   "description": "Live on-map readout while you build track — segment length, curve radius, max speed, and elevation as you draw, plus persistent per-node height labels for the route you're laying and your already-built tracks.",
   "version": "1.0.0",

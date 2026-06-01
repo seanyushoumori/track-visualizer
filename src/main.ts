@@ -8,7 +8,7 @@
 import { TrackVisualizerPanel } from './tv/TrackVisualizerPanel';
 import { startOverlay } from './tv/overlay';
 
-const MOD_ID = 'com.abadsinger.trackvisualizer';
+const MOD_ID = 'track-visualizer';
 const MOD_VERSION = '1.0.0';
 const TAG = '[TrackVisualizer]';
 
