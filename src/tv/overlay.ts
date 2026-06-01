@@ -15,9 +15,8 @@ import type { ModdingAPI } from '../types';
 import type { PreviewInfo } from './preview';
 import { distanceMeters } from './geometry';
 import { readPreview, readElevationNodes, readConstructedElevationNodes } from './preview';
-import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev } from './format';
+import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, fmtHeight } from './format';
 
-const M_TO_FT = 3.28084;
 const NODE_MERGE_PX = 26;
 /** Slow fallback recompute of the network elevation cache (~5 s @ 60fps); primary
  *  trigger is onTrackChange + toggle, so this rarely fires. */
@@ -270,7 +269,7 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
       nodeEls[i] = el;
     }
     const n = kept[i];
-    el.textContent = `${Math.round(n.elevM * M_TO_FT)} ft`;
+    el.textContent = fmtHeight(n.elevM);
     el.style.left = `${n.x}px`;
     el.style.top = `${n.y}px`;
     el.style.display = 'block';

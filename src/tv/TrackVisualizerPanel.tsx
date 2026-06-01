@@ -8,11 +8,11 @@
 
 import { useEffect, useState } from 'react';
 import { readPreview } from './preview';
-import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev } from './format';
+import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, MIN_RADIUS_M, isImperial, setImperial } from './format';
 import { isHideNodes, setHideNodes, isShowBuilt, setShowBuilt } from './overlay';
 
 const api = window.SubwayBuilderAPI;
-const { Switch, Label } = api.utils.components as Record<string, React.ComponentType<any>>;
+const { Switch, Label, Button } = api.utils.components as Record<string, React.ComponentType<any>>;
 
 export function TrackVisualizerPanel() {
   const [, force] = useState(0);
@@ -24,8 +24,31 @@ export function TrackVisualizerPanel() {
 
   const preview = readPreview();
 
+  const imperial = isImperial();
+  const unitBtn = (imp: boolean, label: string) => (
+    <Button
+      key={label}
+      size="sm"
+      variant={imperial === imp ? 'default' : 'outline'}
+      className="h-6 px-2 text-xs"
+      onClick={() => {
+        setImperial(imp);
+        rerender();
+      }}
+    >
+      {label}
+    </Button>
+  );
+
   const toggles = (
     <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <Label>Units</Label>
+        <div className="flex gap-1">
+          {unitBtn(false, 'm')}
+          {unitBtn(true, 'ft')}
+        </div>
+      </div>
       <div className="flex items-center justify-between">
         <Label htmlFor="tv-nodes">Show node heights</Label>
         <Switch
@@ -100,7 +123,7 @@ export function TrackVisualizerPanel() {
 
       <p className="mt-1 text-[11px] text-muted-foreground">
         Curve radius and speed come straight from the game; a red radius means it's tighter than
-        the 29 m minimum.
+        the {fmtRadius(MIN_RADIUS_M)} minimum.
       </p>
     </div>
   );
