@@ -2,13 +2,19 @@
  * Track Visualizer — on-map overlay.
  *
  * - Mouse-following summary tooltip while drawing.
- * - Height labels at every node of the route you're laying down. Elevation comes
- *   from this session's captured preview heights, falling back to the network
- *   elevation layer so blueprint tracks from PREVIOUS sessions also resolve.
- * - Optional height labels on already-constructed tracks (toggle).
+ * - Height labels at every node of the route you're laying down + (optionally)
+ *   already-constructed tracks.
  *
- * Labels are plain DOM positioned via map.project() each frame, at a low z-index
- * (above the map, below the game's UI).
+ * Performance model:
+ * - The existing-node set (placed blueprint + built tracks) is CACHED and rebuilt
+ *   only when the network changes — driven by mutation hooks (onTrackChange,
+ *   onTrackBuilt, onBlueprintPlaced, onStationBuilt/Deleted, onCityLoad) plus a
+ *   cheap O(N) "track-set signature" catch-all (so e.g. Build-Blueprints, which
+ *   re-categorises blueprint→constructed, can't leave stale labels).
+ * - Elevation lookups use a spatial grid → the rebuild is O(N), not O(N²).
+ * - Only the live preview (rubber-band) is recomputed per frame, and only while
+ *   drawing. Labels are re-projected only when the camera moves or the set changes;
+ *   idle frames do nothing.
  */
 
 import type { ModdingAPI } from '../types';
@@ -18,17 +24,20 @@ import { readPreview, readElevationNodes, readConstructedElevationNodes } from '
 import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, fmtHeight } from './format';
 
 const NODE_MERGE_PX = 26;
-/** Slow fallback recompute of the network elevation cache (~5 s @ 60fps); primary
- *  trigger is onTrackChange + toggle, so this rarely fires. */
-const NETWORK_RECOMPUTE_FRAMES = 300;
+const GRID_DEG = 0.0001; // ~10 m spatial-index cell
+const ELEV_SNAP_M = 8; // elevation lookup + geo-dedup radius
+const SIG_INTERVAL_FRAMES = 90; // ~1.5 s cheap "did the track set change?" check
 
 interface MapLike {
   getContainer(): HTMLElement;
   project(lnglat: [number, number]): { x: number; y: number };
+  on?(type: string, cb: () => void): void;
+  off?(type: string, cb: () => void): void;
 }
 
 type LngLat = [number, number];
 type GeoNode = { coord: LngLat; elevM: number };
+type Grid = Map<string, GeoNode[]>;
 
 let tooltip: HTMLDivElement | null = null;
 let nodeEls: HTMLDivElement[] = [];
@@ -38,23 +47,36 @@ let started = false;
 let hideNodes = false;
 let showBuilt = false;
 
+let mapRef: MapLike | null = null;
+let onMove: (() => void) | null = null;
+
 let frame = 0;
-let networkElev: GeoNode[] = []; // per-endpoint heights of all placed tracks (built + blueprint)
-let builtGeo: GeoNode[] = []; // constructed-track nodes (when showBuilt)
-let elevDirty = true;
+let cachedGeo: GeoNode[] = []; // deduped existing-node set (blueprint + built)
+let networkGrid: Grid = new Map(); // spatial index over the network elevation table
+let nodesDirty = true; // rebuild the existing-node set
+let needsRender = true; // re-project / reposition labels
+let wasDrawing = false;
+let lastSig = '';
 
 export function setHideNodes(v: boolean): void {
   hideNodes = v;
+  nodesDirty = true;
+  needsRender = true;
 }
 export function isHideNodes(): boolean {
   return hideNodes;
 }
 export function setShowBuilt(v: boolean): void {
   showBuilt = v;
-  elevDirty = true;
+  nodesDirty = true;
+  needsRender = true;
 }
 export function isShowBuilt(): boolean {
   return showBuilt;
+}
+/** Force one render pass — e.g. after the units toggle changes label text. */
+export function requestRender(): void {
+  needsRender = true;
 }
 
 // --- captured set-elevation per node (recorded from the preview during drag) ---
@@ -72,7 +94,43 @@ function recordElev(coord: LngLat, elevM: number | null): void {
   if (captured.length > 4000) captured.shift();
 }
 
-function nearestElev(nodes: GeoNode[], coord: LngLat, maxM = 8): number | null {
+// --- spatial index ---
+function cellKey(lng: number, lat: number): string {
+  return `${Math.floor(lng / GRID_DEG)}|${Math.floor(lat / GRID_DEG)}`;
+}
+function buildGrid(nodes: GeoNode[]): Grid {
+  const g: Grid = new Map();
+  for (const n of nodes) {
+    const k = cellKey(n.coord[0], n.coord[1]);
+    const b = g.get(k);
+    if (b) b.push(n);
+    else g.set(k, [n]);
+  }
+  return g;
+}
+/** Nearest node elevation within `maxM` (checks the cell + 8 neighbours). O(1) amortised. */
+function nearestElevGrid(grid: Grid, coord: LngLat, maxM = ELEV_SNAP_M): number | null {
+  const cx = Math.floor(coord[0] / GRID_DEG);
+  const cy = Math.floor(coord[1] / GRID_DEG);
+  let best: number | null = null;
+  let bestD = maxM;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const b = grid.get(`${cx + dx}|${cy + dy}`);
+      if (!b) continue;
+      for (const n of b) {
+        const d = distanceMeters(n.coord, coord);
+        if (d < bestD) {
+          bestD = d;
+          best = n.elevM;
+        }
+      }
+    }
+  }
+  return best;
+}
+/** Linear nearest — only for small live sets (the preview's `captured` heights). */
+function nearestElev(nodes: GeoNode[], coord: LngLat, maxM = ELEV_SNAP_M): number | null {
   let best: number | null = null;
   let bestD = maxM;
   for (const c of nodes) {
@@ -83,6 +141,29 @@ function nearestElev(nodes: GeoNode[], coord: LngLat, maxM = 8): number | null {
     }
   }
   return best;
+}
+/** Grid-based dedupe at `ELEV_SNAP_M`. O(N). */
+function gridDedup(raw: GeoNode[]): GeoNode[] {
+  const g: Grid = new Map();
+  const out: GeoNode[] = [];
+  for (const n of raw) {
+    const cx = Math.floor(n.coord[0] / GRID_DEG);
+    const cy = Math.floor(n.coord[1] / GRID_DEG);
+    let dup = false;
+    for (let dx = -1; dx <= 1 && !dup; dx++) {
+      for (let dy = -1; dy <= 1 && !dup; dy++) {
+        const b = g.get(`${cx + dx}|${cy + dy}`);
+        if (b) for (const m of b) if (distanceMeters(m.coord, n.coord) < ELEV_SNAP_M) { dup = true; break; }
+      }
+    }
+    if (dup) continue;
+    out.push(n);
+    const k = `${cx}|${cy}`;
+    const b = g.get(k);
+    if (b) b.push(n);
+    else g.set(k, [n]);
+  }
+  return out;
 }
 
 function makeTooltip(): HTMLDivElement {
@@ -106,10 +187,76 @@ function makeNodeLabel(): HTMLDivElement {
   return d;
 }
 
+/** Cheap O(N) signature of the track set (counts only) — catches missed mutations. */
+function trackSignature(api: ModdingAPI): string {
+  let total = 0;
+  let blueprint = 0;
+  try {
+    for (const t of api.gameState.getTracks()) {
+      total++;
+      if (t.buildType === 'blueprint') blueprint++;
+    }
+  } catch {
+    /* ignore */
+  }
+  return `${total}|${blueprint}`;
+}
+
+/** Rebuild the cached existing-node set (placed blueprint + built). O(N) via the grid. */
+function rebuildExisting(api: ModdingAPI): void {
+  networkGrid = buildGrid(readConstructedElevationNodes());
+  const capturedGrid = buildGrid(captured);
+  const blueprintElev = (coord: LngLat) =>
+    nearestElevGrid(capturedGrid, coord) ?? nearestElevGrid(networkGrid, coord);
+
+  const raw: GeoNode[] = [];
+  try {
+    for (const t of api.gameState.getTracks()) {
+      const c = t.coords as LngLat[] | undefined;
+      if (!c || c.length < 2) continue;
+      const ends: LngLat[] = [c[0], c[c.length - 1]];
+      if (t.buildType === 'blueprint') {
+        if (hideNodes) continue;
+        for (const coord of ends) {
+          const e = blueprintElev(coord);
+          if (e != null) raw.push({ coord, elevM: e });
+        }
+      } else if (t.buildType === 'constructed') {
+        if (!showBuilt) continue;
+        for (const coord of ends) {
+          const e = nearestElevGrid(networkGrid, coord);
+          if (e != null) raw.push({ coord, elevM: e });
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  cachedGeo = gridDedup(raw);
+  lastSig = trackSignature(api);
+}
+
+/** Live preview (rubber-band) nodes — small set, recomputed each frame while drawing. */
+function previewNodes(preview: PreviewInfo): GeoNode[] {
+  for (const en of readElevationNodes()) recordElev(en.coord, en.elevM);
+  const out: GeoNode[] = [];
+  const add = (coord: LngLat) => {
+    const e = nearestElev(captured, coord) ?? nearestElevGrid(networkGrid, coord);
+    if (e != null) out.push({ coord, elevM: e });
+  };
+  if (preview.segments.length > 0) {
+    add(preview.segments[0].coords[0] as LngLat);
+    for (const s of preview.segments) add(s.coords[s.coords.length - 1] as LngLat);
+  }
+  return out;
+}
+
 export function startOverlay(api: ModdingAPI): void {
   const map = api.utils.getMap?.() as unknown as MapLike | null;
   if (!map || started) return;
   started = true;
+  mapRef = map;
 
   const container = map.getContainer();
   tooltip = makeTooltip();
@@ -120,11 +267,39 @@ export function startOverlay(api: ModdingAPI): void {
     mouse = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
   });
 
-  // Placed tracks rarely change — refresh the elevation cache only when they do.
+  // Existing nodes change only on mutations — refresh the cache when they happen.
+  const markDirty = () => {
+    nodesDirty = true;
+  };
+  const onCity = () => {
+    captured.length = 0;
+    cachedGeo = [];
+    nodesDirty = true;
+    needsRender = true;
+  };
+  for (const wire of [
+    () => api.hooks.onTrackChange(markDirty),
+    () => api.hooks.onTrackBuilt(markDirty),
+    () => api.hooks.onBlueprintPlaced(markDirty),
+    () => api.hooks.onStationBuilt(markDirty),
+    () => api.hooks.onStationDeleted(markDirty),
+    () => api.hooks.onCityLoad(onCity),
+    () => api.hooks.onGameLoaded(onCity),
+  ]) {
+    try {
+      wire();
+    } catch {
+      /* hook may not exist */
+    }
+  }
+
+  // Re-project labels only when the camera moves.
+  onMove = () => {
+    needsRender = true;
+  };
   try {
-    api.hooks.onTrackChange(() => {
-      elevDirty = true;
-    });
+    map.on?.('move', onMove);
+    map.on?.('resize', onMove);
   } catch {
     /* ignore */
   }
@@ -142,83 +317,29 @@ export function startOverlay(api: ModdingAPI): void {
 
 export function stopOverlay(): void {
   if (raf) cancelAnimationFrame(raf);
+  if (mapRef && onMove) {
+    try {
+      mapRef.off?.('move', onMove);
+      mapRef.off?.('resize', onMove);
+    } catch {
+      /* ignore */
+    }
+  }
   tooltip?.remove();
   nodeEls.forEach((e) => e.remove());
   tooltip = null;
   nodeEls = [];
+  mapRef = null;
+  onMove = null;
   raf = 0;
   started = false;
-}
-
-function dedupGeo(raw: GeoNode[]): GeoNode[] {
-  const out: GeoNode[] = [];
-  for (const n of raw) {
-    if (!out.some((d) => distanceMeters(d.coord, n.coord) < 8)) out.push(n);
-  }
-  return out;
-}
-
-/** Refresh the network elevation cache (built + blueprint) and the built-node set. */
-function recomputeNetwork(api: ModdingAPI): void {
-  networkElev = readConstructedElevationNodes();
-
-  if (!showBuilt) {
-    builtGeo = [];
-  } else {
-    const raw: GeoNode[] = [];
-    try {
-      for (const t of api.gameState.getTracks()) {
-        if (t.buildType !== 'constructed') continue;
-        const c = t.coords as LngLat[] | undefined;
-        if (!c || c.length < 2) continue;
-        for (const coord of [c[0], c[c.length - 1]]) {
-          const elevM = nearestElev(networkElev, coord);
-          if (elevM != null) raw.push({ coord, elevM });
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-    builtGeo = dedupGeo(raw);
-  }
-}
-
-/** Geographic nodes of the in-progress route (preview rubber-band + placed blueprints). */
-function inProgressGeoNodes(api: ModdingAPI, preview: PreviewInfo): GeoNode[] {
-  for (const en of readElevationNodes()) recordElev(en.coord, en.elevM);
-
-  const out: GeoNode[] = [];
-  const add = (coord: LngLat) => {
-    // This session's captured set-height first; fall back to the network layer so
-    // blueprint tracks placed in PREVIOUS sessions still resolve.
-    const elevM = nearestElev(captured, coord) ?? nearestElev(networkElev, coord);
-    if (elevM != null) out.push({ coord, elevM });
-  };
-
-  try {
-    for (const t of api.gameState.getTracks()) {
-      if (t.buildType !== 'blueprint') continue;
-      const c = t.coords as LngLat[] | undefined;
-      if (!c || c.length < 2) continue;
-      add(c[0]);
-      add(c[c.length - 1]);
-    }
-  } catch {
-    /* ignore */
-  }
-
-  if (preview.segments.length > 0) {
-    const segs = preview.segments;
-    add(segs[0].coords[0] as LngLat);
-    for (const s of segs) add(s.coords[s.coords.length - 1] as LngLat);
-  }
-  return out;
 }
 
 function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
   if (!tooltip) return;
   frame++;
   const preview = readPreview();
+  const drawing = preview.active && preview.segments.length > 0;
 
   // --- mouse-following summary tooltip (while actively drawing) ---
   if (preview.active && preview.coords.length >= 2) {
@@ -239,16 +360,28 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
     tooltip.style.display = 'none';
   }
 
-  // --- node height labels ---
-  const needNetwork = !hideNodes || showBuilt;
-  if (needNetwork && (elevDirty || frame % NETWORK_RECOMPUTE_FRAMES === 1)) {
-    recomputeNetwork(api);
-    elevDirty = false;
+  // --- refresh the existing-node set: on mutation, or a cheap periodic signature change ---
+  if (nodesDirty) {
+    rebuildExisting(api);
+    nodesDirty = false;
+    needsRender = true;
+  } else if (frame % SIG_INTERVAL_FRAMES === 0 && trackSignature(api) !== lastSig) {
+    rebuildExisting(api);
+    needsRender = true;
   }
 
-  const geo: GeoNode[] = [];
-  if (!hideNodes) geo.push(...inProgressGeoNodes(api, preview));
-  if (showBuilt) geo.push(...builtGeo);
+  // --- live preview nodes (only while drawing) ---
+  let pv: GeoNode[] = [];
+  if (drawing && !hideNodes) {
+    pv = previewNodes(preview);
+    needsRender = true;
+  }
+  if (drawing !== wasDrawing) needsRender = true; // start/stop of a drag needs one render
+  wasDrawing = drawing;
+
+  if (!needsRender) return;
+
+  const geo = pv.length ? cachedGeo.concat(pv) : cachedGeo;
 
   // Project + viewport-cull + screen-space dedupe.
   const w = container.clientWidth;
@@ -275,4 +408,6 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
     el.style.display = 'block';
   }
   for (let i = kept.length; i < nodeEls.length; i++) nodeEls[i].style.display = 'none';
+
+  needsRender = false;
 }

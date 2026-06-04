@@ -9,7 +9,7 @@
 import { useEffect, useState } from 'react';
 import { readPreview } from './preview';
 import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, MIN_RADIUS_M, isImperial, setImperial } from './format';
-import { isHideNodes, setHideNodes, isShowBuilt, setShowBuilt } from './overlay';
+import { isHideNodes, setHideNodes, isShowBuilt, setShowBuilt, requestRender } from './overlay';
 
 const api = window.SubwayBuilderAPI;
 const { Switch, Label, Button } = api.utils.components as Record<string, React.ComponentType<any>>;
@@ -33,6 +33,7 @@ export function TrackVisualizerPanel() {
       className="h-6 px-2 text-xs"
       onClick={() => {
         setImperial(imp);
+        requestRender();
         rerender();
       }}
     >
