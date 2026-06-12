@@ -29,6 +29,8 @@ const ELEV_SNAP_M = 8; // elevation lookup + geo-dedup radius
 const SIG_INTERVAL_FRAMES = 90; // ~1.5 s cheap "did the track set change?" check
 const JUNCTION_M = 4; // crossings within this of a node are junctions, not crossings
 const SAME_HEIGHT_M = 2; // two tracks within this elevation gap count as "same height"
+const XOVER_DEDUP_DEG = 0.0001 / 14; // ~0.7 m — merge only near-coincident crossings, keep distinct ones
+const XOVER_DEBOUNCE_FRAMES = 30; // recompute crossings ~0.5 s after edits settle, not per-mutation
 
 interface MapLike {
   getContainer(): HTMLElement;
@@ -57,7 +59,9 @@ let onMove: (() => void) | null = null;
 let frame = 0;
 let cachedGeo: GeoNode[] = []; // deduped existing-node set (blueprint + built)
 let networkGrid: Grid = new Map(); // spatial index over the network elevation table
-let intersectionPts: LngLat[] = []; // same-height track crossings (cached, rebuilt on mutation)
+let intersectionPts: LngLat[] = []; // same-height track crossings (cached)
+let intersectionsDirty = false; // crossings need a (debounced) recompute
+let lastRebuildFrame = 0; // frame of the last network rebuild — debounce baseline
 let nodesDirty = true; // rebuild the existing-node set
 let needsRender = true; // re-project / reposition labels
 let wasDrawing = false;
@@ -260,14 +264,25 @@ function rebuildExisting(api: ModdingAPI): void {
   }
 
   cachedGeo = gridDedup(raw);
-  intersectionPts = showIntersections ? computeIntersections(api) : [];
+  // Don't run the (potentially expensive) crossing pass inline on every mutation —
+  // mark it dirty and let the debounced recompute in update() handle it.
+  if (showIntersections) {
+    intersectionsDirty = true;
+    lastRebuildFrame = frame;
+  } else {
+    intersectionPts = [];
+    intersectionsDirty = false;
+  }
   lastSig = trackSignature(api);
 }
 
 /** Same-height track crossings: interior segment intersections at ~equal elevation. */
 function computeIntersections(api: ModdingAPI): LngLat[] {
+  // Prefer the reliable constructed-elevation grid (same source the height labels
+  // use); only fall back to the drag-captured set — checking captured first can
+  // return a nearby track's elevation at a dense interchange and false-match heights.
   const elevAt = (coord: LngLat): number | null =>
-    nearestElev(captured, coord) ?? nearestElevGrid(networkGrid, coord);
+    nearestElevGrid(networkGrid, coord) ?? nearestElev(captured, coord);
 
   type Seg = { a: LngLat; b: LngLat; ea: number; eb: number };
   const segs: Seg[] = [];
@@ -332,7 +347,7 @@ function computeIntersections(api: ModdingAPI): LngLat[] {
         const eA = A.ea + hit.t * (A.eb - A.ea);
         const eB = B.ea + hit.u * (B.eb - B.ea);
         if (Math.abs(eA - eB) > SAME_HEIGHT_M) continue; // different heights → grade-separated
-        const ptk = `${Math.round(hit.point[0] / GRID_DEG)}|${Math.round(hit.point[1] / GRID_DEG)}`;
+        const ptk = `${Math.round(hit.point[0] / XOVER_DEDUP_DEG)}|${Math.round(hit.point[1] / XOVER_DEDUP_DEG)}`;
         if (seenPt.has(ptk)) continue;
         seenPt.add(ptk);
         out.push(hit.point);
@@ -484,6 +499,13 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
     needsRender = true;
   }
 
+  // --- debounced crossing recompute: the expensive pass runs once edits settle ---
+  if (showIntersections && intersectionsDirty && frame - lastRebuildFrame >= XOVER_DEBOUNCE_FRAMES) {
+    intersectionPts = computeIntersections(api);
+    intersectionsDirty = false;
+    needsRender = true;
+  }
+
   // --- live preview nodes (only while drawing) ---
   let pv: GeoNode[] = [];
   if (drawing && !hideNodes) {
@@ -497,15 +519,29 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
 
   const geo = pv.length ? cachedGeo.concat(pv) : cachedGeo;
 
-  // Project + viewport-cull + screen-space dedupe.
+  // Project + viewport-cull + screen-space dedupe (grid-bucketed → O(N), not O(N²)).
   const w = container.clientWidth;
   const h = container.clientHeight;
   const kept: { x: number; y: number; elevM: number }[] = [];
+  const screenGrid = new Map<string, { x: number; y: number }[]>();
   for (const n of geo) {
     const pt = map.project(n.coord);
     if (pt.x < -40 || pt.y < -40 || pt.x > w + 40 || pt.y > h + 40) continue;
-    if (kept.some((k) => Math.hypot(k.x - pt.x, k.y - pt.y) < NODE_MERGE_PX)) continue;
+    const cx = Math.floor(pt.x / NODE_MERGE_PX);
+    const cy = Math.floor(pt.y / NODE_MERGE_PX);
+    let dup = false;
+    for (let dx = -1; dx <= 1 && !dup; dx++) {
+      for (let dy = -1; dy <= 1 && !dup; dy++) {
+        const b = screenGrid.get(`${cx + dx}|${cy + dy}`);
+        if (b) for (const k of b) if (Math.hypot(k.x - pt.x, k.y - pt.y) < NODE_MERGE_PX) { dup = true; break; }
+      }
+    }
+    if (dup) continue;
     kept.push({ x: pt.x, y: pt.y, elevM: n.elevM });
+    const key = `${cx}|${cy}`;
+    const b = screenGrid.get(key);
+    if (b) b.push({ x: pt.x, y: pt.y });
+    else screenGrid.set(key, [{ x: pt.x, y: pt.y }]);
   }
 
   for (let i = 0; i < kept.length; i++) {
