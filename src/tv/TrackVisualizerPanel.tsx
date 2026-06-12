@@ -9,10 +9,48 @@
 import { useEffect, useState } from 'react';
 import { readPreview } from './preview';
 import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, MIN_RADIUS_M, isImperial, setImperial } from './format';
-import { isHideNodes, setHideNodes, isShowBuilt, setShowBuilt, requestRender } from './overlay';
+import {
+  isHideNodes,
+  setHideNodes,
+  isShowBuilt,
+  setShowBuilt,
+  isShowIntersections,
+  setShowIntersections,
+  requestRender,
+} from './overlay';
 
 const api = window.SubwayBuilderAPI;
 const { Switch, Label, Button } = api.utils.components as Record<string, React.ComponentType<any>>;
+
+/** A small "?" badge with a native hover tooltip. Rendered inline inside a label
+ *  so it flows right after the text (and wraps with it). */
+function Help({ text }: { text: string }) {
+  return (
+    <span
+      title={text}
+      onClick={(e: { preventDefault: () => void }) => e.preventDefault()}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        width: '13px',
+        height: '13px',
+        borderRadius: '50%',
+        border: '1px solid currentColor',
+        fontSize: '9px',
+        fontWeight: 700,
+        lineHeight: 1,
+        cursor: 'help',
+        opacity: 0.5,
+        verticalAlign: 'middle',
+        marginLeft: '3px',
+        flexShrink: 0,
+      }}
+    >
+      ?
+    </span>
+  );
+}
 
 export function TrackVisualizerPanel() {
   const [, force] = useState(0);
@@ -43,15 +81,21 @@ export function TrackVisualizerPanel() {
 
   const toggles = (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <Label>Units</Label>
+      <div className="flex items-center justify-between gap-2">
+        <Label>
+          Units
+          <Help text="Switch the overlay's labels between metric (m, km, km/h) and imperial (ft, mi, mph). Matches the game's own units setting on load." />
+        </Label>
         <div className="flex gap-1">
           {unitBtn(false, 'm')}
           {unitBtn(true, 'ft')}
         </div>
       </div>
-      <div className="flex items-center justify-between">
-        <Label htmlFor="tv-nodes">Show node heights</Label>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="tv-nodes">
+          Show node heights
+          <Help text="Label every node of the route you're drawing (and any placed blueprints) with its set elevation, right on the map." />
+        </Label>
         <Switch
           id="tv-nodes"
           checked={!isHideNodes()}
@@ -61,13 +105,30 @@ export function TrackVisualizerPanel() {
           }}
         />
       </div>
-      <div className="flex items-center justify-between">
-        <Label htmlFor="tv-built">Show built-track heights</Label>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="tv-built">
+          Show built-track heights
+          <Help text="Also label the node elevations of your already-constructed tracks — handy for matching heights when extending the network." />
+        </Label>
         <Switch
           id="tv-built"
           checked={isShowBuilt()}
           onCheckedChange={(v: boolean) => {
             setShowBuilt(v);
+            rerender();
+          }}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="tv-crossings">
+          Mark same-height crossings
+          <Help text="Drop a circle wherever two tracks cross at the same elevation — a potential at-grade conflict you may want to grade-separate. Junctions where tracks simply meet aren't marked." />
+        </Label>
+        <Switch
+          id="tv-crossings"
+          checked={isShowIntersections()}
+          onCheckedChange={(v: boolean) => {
+            setShowIntersections(v);
             rerender();
           }}
         />

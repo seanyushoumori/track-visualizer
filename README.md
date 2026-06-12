@@ -8,7 +8,8 @@ A build-assist mod for **Subway Builder**. It overlays the geometry you can't ea
 - **Metric & imperial.** A **Units: m / ft** toggle in the panel. It auto-matches the game's own units setting on load (metric — m / km / km/h — by default, or imperial — ft / mi / mph), and you can flip it anytime. (The game doesn't expose its *live* units toggle to mods, so the auto-match runs on load/reload; flip the toggle for an in-session switch.)
 - **Per-node height labels.** Every node of the route you're laying is labelled with its set elevation, on the map, and stays put as you keep building. Coincident nodes (parallel rails, station ends) collapse to a single label.
 - **Built-track heights (toggle).** Optionally label the node heights of your already-constructed tracks too — handy for matching elevations when extending the network.
-- **Panel.** A small floating panel with the live stats and toggles for the on-map labels.
+- **Same-height crossings (toggle).** Marks with a circle wherever two tracks cross at the same elevation — a potential at-grade conflict you may want to grade-separate. Junctions where tracks simply meet aren't marked.
+- **Panel.** A small floating panel with the live stats and toggles for the on-map labels, each with a **?** hover tooltip explaining what it does.
 
 ## Usage
 

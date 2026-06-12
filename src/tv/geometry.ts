@@ -36,6 +36,27 @@ export function totalLength(coords: LngLat[]): number {
   return sum;
 }
 
+/**
+ * Planar segment intersection for [lng, lat] pairs (exact enough at city scale).
+ * Returns the crossing point and the fraction along each segment (t along p1→p2,
+ * u along p3→p4), or null if they don't cross in the interior of both.
+ */
+export function segmentIntersection(
+  p1: LngLat,
+  p2: LngLat,
+  p3: LngLat,
+  p4: LngLat,
+): { point: LngLat; t: number; u: number } | null {
+  const x1 = p1[0], y1 = p1[1], x2 = p2[0], y2 = p2[1];
+  const x3 = p3[0], y3 = p3[1], x4 = p4[0], y4 = p4[1];
+  const d = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3);
+  if (Math.abs(d) < 1e-14) return null; // parallel / collinear
+  const t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / d;
+  const u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / d;
+  if (t <= 0 || t >= 1 || u <= 0 || u >= 1) return null; // interior of both only
+  return { point: [x1 + t * (x2 - x1), y1 + t * (y2 - y1)], t, u };
+}
+
 export interface Vertex {
   /** Index in the coords array. */
   index: number;

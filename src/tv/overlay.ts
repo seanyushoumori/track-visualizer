@@ -19,7 +19,7 @@
 
 import type { ModdingAPI } from '../types';
 import type { PreviewInfo } from './preview';
-import { distanceMeters } from './geometry';
+import { distanceMeters, segmentIntersection } from './geometry';
 import { readPreview, readElevationNodes, readConstructedElevationNodes } from './preview';
 import { computeStats, fmtLength, fmtRadius, fmtSpeed, fmtElev, fmtHeight } from './format';
 
@@ -27,6 +27,8 @@ const NODE_MERGE_PX = 26;
 const GRID_DEG = 0.0001; // ~10 m spatial-index cell
 const ELEV_SNAP_M = 8; // elevation lookup + geo-dedup radius
 const SIG_INTERVAL_FRAMES = 90; // ~1.5 s cheap "did the track set change?" check
+const JUNCTION_M = 4; // crossings within this of a node are junctions, not crossings
+const SAME_HEIGHT_M = 2; // two tracks within this elevation gap count as "same height"
 
 interface MapLike {
   getContainer(): HTMLElement;
@@ -41,11 +43,13 @@ type Grid = Map<string, GeoNode[]>;
 
 let tooltip: HTMLDivElement | null = null;
 let nodeEls: HTMLDivElement[] = [];
+let dotEls: HTMLDivElement[] = []; // crossing markers
 let mouse: { x: number; y: number } | null = null;
 let raf = 0;
 let started = false;
 let hideNodes = false;
 let showBuilt = false;
+let showIntersections = false;
 
 let mapRef: MapLike | null = null;
 let onMove: (() => void) | null = null;
@@ -53,6 +57,7 @@ let onMove: (() => void) | null = null;
 let frame = 0;
 let cachedGeo: GeoNode[] = []; // deduped existing-node set (blueprint + built)
 let networkGrid: Grid = new Map(); // spatial index over the network elevation table
+let intersectionPts: LngLat[] = []; // same-height track crossings (cached, rebuilt on mutation)
 let nodesDirty = true; // rebuild the existing-node set
 let needsRender = true; // re-project / reposition labels
 let wasDrawing = false;
@@ -73,6 +78,14 @@ export function setShowBuilt(v: boolean): void {
 }
 export function isShowBuilt(): boolean {
   return showBuilt;
+}
+export function setShowIntersections(v: boolean): void {
+  showIntersections = v;
+  nodesDirty = true; // recompute crossings on the next rebuild
+  needsRender = true;
+}
+export function isShowIntersections(): boolean {
+  return showIntersections;
 }
 /** Force one render pass — e.g. after the units toggle changes label text. */
 export function requestRender(): void {
@@ -174,6 +187,7 @@ function makeTooltip(): HTMLDivElement {
     'padding:7px 9px;border-radius:7px;white-space:nowrap;display:none',
     'box-shadow:0 2px 10px rgba(0,0,0,0.45)',
   ].join(';');
+  d.setAttribute('data-tv-ov', '1');
   return d;
 }
 
@@ -184,6 +198,18 @@ function makeNodeLabel(): HTMLDivElement {
     'color:#111;font:11px/1 system-ui,-apple-system,sans-serif;font-weight:600',
     'text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 2px #fff,0 0 2px #fff;white-space:nowrap;display:none',
   ].join(';');
+  d.setAttribute('data-tv-ov', '1');
+  return d;
+}
+
+function makeDot(): HTMLDivElement {
+  const d = document.createElement('div');
+  d.style.cssText = [
+    'position:absolute;z-index:1;pointer-events:none;transform:translate(-50%,-50%)',
+    'width:12px;height:12px;border-radius:50%;box-sizing:border-box',
+    'background:rgba(245,158,11,0.25);border:2px solid #f59e0b;display:none',
+  ].join(';');
+  d.setAttribute('data-tv-ov', '1');
   return d;
 }
 
@@ -234,7 +260,86 @@ function rebuildExisting(api: ModdingAPI): void {
   }
 
   cachedGeo = gridDedup(raw);
+  intersectionPts = showIntersections ? computeIntersections(api) : [];
   lastSig = trackSignature(api);
+}
+
+/** Same-height track crossings: interior segment intersections at ~equal elevation. */
+function computeIntersections(api: ModdingAPI): LngLat[] {
+  const elevAt = (coord: LngLat): number | null =>
+    nearestElev(captured, coord) ?? nearestElevGrid(networkGrid, coord);
+
+  type Seg = { a: LngLat; b: LngLat; ea: number; eb: number };
+  const segs: Seg[] = [];
+  try {
+    for (const t of api.gameState.getTracks()) {
+      const c = t.coords as LngLat[] | undefined;
+      if (!c || c.length < 2) continue;
+      for (let i = 1; i < c.length; i++) {
+        const a = c[i - 1];
+        const b = c[i];
+        const ea = elevAt(a);
+        const eb = elevAt(b);
+        if (ea == null || eb == null) continue; // no elevation data → can't judge height
+        segs.push({ a, b, ea, eb });
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Bucket segments into the grid cells their bounding box covers, to prune pairs.
+  const buckets = new Map<string, number[]>();
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    const x0 = Math.floor(Math.min(s.a[0], s.b[0]) / GRID_DEG);
+    const x1 = Math.floor(Math.max(s.a[0], s.b[0]) / GRID_DEG);
+    const y0 = Math.floor(Math.min(s.a[1], s.b[1]) / GRID_DEG);
+    const y1 = Math.floor(Math.max(s.a[1], s.b[1]) / GRID_DEG);
+    for (let x = x0; x <= x1; x++)
+      for (let y = y0; y <= y1; y++) {
+        const k = `${x}|${y}`;
+        const arr = buckets.get(k);
+        if (arr) arr.push(i);
+        else buckets.set(k, [i]);
+      }
+  }
+
+  const out: LngLat[] = [];
+  const seenPair = new Set<string>();
+  const seenPt = new Set<string>();
+  for (const arr of buckets.values()) {
+    for (let p = 0; p < arr.length; p++) {
+      for (let q = p + 1; q < arr.length; q++) {
+        const i = Math.min(arr[p], arr[q]);
+        const j = Math.max(arr[p], arr[q]);
+        const pk = `${i}|${j}`;
+        if (seenPair.has(pk)) continue;
+        seenPair.add(pk);
+        const A = segs[i];
+        const B = segs[j];
+        const hit = segmentIntersection(A.a, A.b, B.a, B.b);
+        if (!hit) continue;
+        // skip junctions: crossing coinciding with a node of either segment
+        if (
+          distanceMeters(hit.point, A.a) < JUNCTION_M ||
+          distanceMeters(hit.point, A.b) < JUNCTION_M ||
+          distanceMeters(hit.point, B.a) < JUNCTION_M ||
+          distanceMeters(hit.point, B.b) < JUNCTION_M
+        )
+          continue;
+        // elevation of each track at the crossing (linear along the segment)
+        const eA = A.ea + hit.t * (A.eb - A.ea);
+        const eB = B.ea + hit.u * (B.eb - B.ea);
+        if (Math.abs(eA - eB) > SAME_HEIGHT_M) continue; // different heights → grade-separated
+        const ptk = `${Math.round(hit.point[0] / GRID_DEG)}|${Math.round(hit.point[1] / GRID_DEG)}`;
+        if (seenPt.has(ptk)) continue;
+        seenPt.add(ptk);
+        out.push(hit.point);
+      }
+    }
+  }
+  return out;
 }
 
 /** Live preview (rubber-band) nodes — small set, recomputed each frame while drawing. */
@@ -256,8 +361,14 @@ export function startOverlay(api: ModdingAPI): void {
   const map = api.utils.getMap?.() as unknown as MapLike | null;
   if (!map || started) return;
   started = true;
-  mapRef = map;
 
+  // Tear down any overlay a previous (hot-reloaded) module instance left behind:
+  // remove its orphaned DOM, and bump a global generation so its RAF loop self-stops.
+  const G = window as unknown as { __tvOverlayGen?: number };
+  const myGen = (G.__tvOverlayGen = (G.__tvOverlayGen ?? 0) + 1);
+  document.querySelectorAll('[data-tv-ov]').forEach((e) => e.remove());
+
+  mapRef = map;
   const container = map.getContainer();
   tooltip = makeTooltip();
   container.appendChild(tooltip);
@@ -305,6 +416,7 @@ export function startOverlay(api: ModdingAPI): void {
   }
 
   const loop = () => {
+    if (myGen !== G.__tvOverlayGen) return; // a newer instance took over → stop this loop
     try {
       update(api, map, container);
     } catch {
@@ -327,8 +439,10 @@ export function stopOverlay(): void {
   }
   tooltip?.remove();
   nodeEls.forEach((e) => e.remove());
+  dotEls.forEach((e) => e.remove());
   tooltip = null;
   nodeEls = [];
+  dotEls = [];
   mapRef = null;
   onMove = null;
   raf = 0;
@@ -408,6 +522,28 @@ function update(api: ModdingAPI, map: MapLike, container: HTMLElement): void {
     el.style.display = 'block';
   }
   for (let i = kept.length; i < nodeEls.length; i++) nodeEls[i].style.display = 'none';
+
+  // --- same-height crossing markers ---
+  if (showIntersections) {
+    let di = 0;
+    for (const pt of intersectionPts) {
+      const p = map.project(pt);
+      if (p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue;
+      let el = dotEls[di];
+      if (!el) {
+        el = makeDot();
+        container.appendChild(el);
+        dotEls[di] = el;
+      }
+      el.style.left = `${p.x}px`;
+      el.style.top = `${p.y}px`;
+      el.style.display = 'block';
+      di++;
+    }
+    for (let i = di; i < dotEls.length; i++) dotEls[i].style.display = 'none';
+  } else {
+    for (const el of dotEls) el.style.display = 'none';
+  }
 
   needsRender = false;
 }
