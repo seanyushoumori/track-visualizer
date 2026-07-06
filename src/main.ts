@@ -9,7 +9,7 @@ import { TrackVisualizerPanel } from './tv/TrackVisualizerPanel';
 import { startOverlay } from './tv/overlay';
 
 const MOD_ID = 'track-visualizer';
-const MOD_VERSION = '1.2.1';
+const MOD_VERSION = '1.2.2';
 const TAG = '[TrackVisualizer]';
 
 const api = window.SubwayBuilderAPI;

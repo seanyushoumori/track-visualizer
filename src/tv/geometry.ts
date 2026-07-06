@@ -37,6 +37,63 @@ export function totalLength(coords: LngLat[]): number {
 }
 
 /**
+ * Length of a *single* rail when the preview may carry N parallel copies of the
+ * drawn path (parallel = 2 rails, quad = 4). The game emits each parallel rail
+ * as its own chain of segments, so naively summing every segment double- or
+ * quadruple-counts the distance. We group segments into connected rails by
+ * shared endpoints — parallel rails never touch, they're offset by the track
+ * spacing (~3.8 m) — and return the *median* rail length. The median equals one
+ * rail's true length and, on curves where the inner/outer rails differ, lands
+ * on the centerline; it's also robust to a stray connector or an accidental
+ * split. Pass each segment's own coordinate list.
+ */
+export function singleRailLength(segments: LngLat[][]): number {
+  const segs = segments.filter((c) => c && c.length >= 2);
+  const n = segs.length;
+  if (n === 0) return 0;
+  if (n === 1) return totalLength(segs[0]);
+
+  const lens = segs.map(totalLength);
+  const ends = segs.map((c) => [c[0], c[c.length - 1]] as [LngLat, LngLat]);
+
+  // Union-find: merge segments whose endpoints coincide (< 1 m, far below the
+  // ~3.8 m parallel-track spacing, so distinct rails stay in separate groups).
+  const EPS_M = 1;
+  const parent = segs.map((_, i) => i);
+  const find = (x: number): number => {
+    while (parent[x] !== x) x = parent[x] = parent[parent[x]];
+    return x;
+  };
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const [ai, bi] = ends[i];
+      const [aj, bj] = ends[j];
+      if (
+        distanceMeters(ai, aj) < EPS_M ||
+        distanceMeters(ai, bj) < EPS_M ||
+        distanceMeters(bi, aj) < EPS_M ||
+        distanceMeters(bi, bj) < EPS_M
+      ) {
+        const ra = find(i);
+        const rb = find(j);
+        if (ra !== rb) parent[ra] = rb;
+      }
+    }
+  }
+
+  // Each connected component is one rail; sum its segment lengths.
+  const railLen = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    const r = find(i);
+    railLen.set(r, (railLen.get(r) ?? 0) + lens[i]);
+  }
+  const rails = [...railLen.values()].filter((l) => l > 0).sort((a, b) => a - b);
+  if (rails.length === 0) return 0;
+  const mid = rails.length >> 1;
+  return rails.length % 2 ? rails[mid] : (rails[mid - 1] + rails[mid]) / 2;
+}
+
+/**
  * Planar segment intersection for [lng, lat] pairs (exact enough at city scale).
  * Returns the crossing point and the fraction along each segment (t along p1→p2,
  * u along p3→p4), or null if they don't cross in the interior of both.

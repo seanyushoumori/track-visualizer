@@ -59,18 +59,24 @@ export function readPreview(): PreviewInfo {
   const coords: LngLat[] = [];
   for (const f of features) {
     const g = f.geometry;
-    let segCoords: LngLat[] = [];
-    if (g?.type === 'LineString') segCoords = (g.coordinates as LngLat[]) ?? [];
-    else if (g?.type === 'MultiLineString') segCoords = ((g.coordinates as LngLat[][]) ?? []).flat();
-    if (segCoords.length === 0) continue;
-    coords.push(...segCoords);
+    // Keep each sub-line separate (don't flatten MultiLineString): if the game
+    // packs the parallel/quad rails into one multi-line feature, flattening them
+    // together would merge distinct rails and break per-rail length grouping.
+    const lines: LngLat[][] =
+      g?.type === 'LineString'
+        ? [(g.coordinates as LngLat[]) ?? []]
+        : g?.type === 'MultiLineString'
+          ? ((g.coordinates as LngLat[][]) ?? [])
+          : [];
     const p = f.properties ?? {};
-    segments.push({
-      coords: segCoords,
-      radius: num(p.radius),
-      speed: num(p.speed),
-      elevation: num(p.elevation),
-    });
+    const radius = num(p.radius);
+    const speed = num(p.speed);
+    const elevation = num(p.elevation);
+    for (const segCoords of lines) {
+      if (!segCoords || segCoords.length === 0) continue;
+      coords.push(...segCoords);
+      segments.push({ coords: segCoords, radius, speed, elevation });
+    }
   }
 
   const validation = (pf?.validation ?? st['previewValidation']) as { isValid?: boolean } | undefined;

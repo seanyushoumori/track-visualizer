@@ -5,7 +5,7 @@
  */
 
 import type { PreviewInfo } from './preview';
-import { totalLength } from './geometry';
+import { singleRailLength } from './geometry';
 
 /** Game's minimum turn radius (meters), from MIN_TURN_RADIUS. */
 export const MIN_RADIUS_M = 29;
@@ -51,7 +51,9 @@ export interface PreviewStats {
 }
 
 export function computeStats(p: PreviewInfo): PreviewStats {
-  const lengthM = totalLength(p.coords);
+  // Parallel/quad builds emit 2/4 offset copies of the path; measure one rail,
+  // not the sum, so the readout shows the distance actually being laid.
+  const lengthM = singleRailLength(p.segments.map((s) => s.coords));
   let minRadius: number | null = null;
   let minSpeed: number | null = null;
   let minElev: number | null = null;
